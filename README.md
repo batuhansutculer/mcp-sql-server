@@ -1,73 +1,193 @@
 # mcp-sql-server
 
+[![tests](https://github.com/batuhansutculer/mcp-sql-server/actions/workflows/tests.yml/badge.svg)](https://github.com/batuhansutculer/mcp-sql-server/actions/workflows/tests.yml)
+
 A Model Context Protocol (MCP) server that lets an AI assistant (Claude) query a
-business database in plain language — safely.
+business database in plain language — behind a policy-enforced access layer.
 
 This is a self-contained prototype of a pattern I build in professional work:
-exposing structured business data to an AI agent through well-defined tools, with
-**server-side guardrails** that control what the agent is allowed to read and do.
-The database and data here are mock, so the whole thing can be public; the design
-mirrors real production tooling I've built to connect Claude to live business systems.
+exposing structured business data to an AI agent through well-defined tools, where
+what the agent may read is decided **server-side, in configuration**, not by the
+prompt. The database and data here are mock, so the whole thing can be public; the
+design mirrors real production tooling I've built to connect Claude to live
+business systems.
 
-## What it does
+## Architecture
 
-The server exposes three tools to Claude over MCP:
+```mermaid
+flowchart LR
+    C["Claude<br/>(MCP client)"] -->|tool call| S["server.py<br/>list_tables · describe_table · run_query"]
+    S --> P{"policy layer<br/>parses the SQL<br/>checks policy.yaml"}
+    P -->|refused| E["error + reason<br/>returned to the model"]
+    P -->|allowed| D[("business.db<br/>opened read-only")]
+    D --> M["output masking"]
+    M --> S
+    P -.-> L[("audit.log")]
+    E -.-> L
+    M -.-> L
+```
+
+Two independent boundaries sit between the model and the data. The policy layer
+refuses queries before they run; the connection is opened read-only, so a write
+that somehow got past the policy layer still fails at the driver. Every attempt,
+allowed or refused, is written to the audit log.
+
+## The tools
 
 | Tool | Purpose |
 |------|---------|
-| `list_tables()` | Lists the tables in the database |
-| `describe_table(name)` | Returns the columns and types of a table |
-| `run_query(sql)` | Runs a **read-only** SQL query and returns the results |
+| `list_tables()` | Lists tables, each flagged with whether the policy allows reading it |
+| `describe_table(name)` | Returns columns and types, each flagged as masked or not |
+| `run_query(sql)` | Validates a read-only query against the policy, runs it, masks the results |
 
-With these, Claude can explore the schema and answer real questions about the data —
-for example, *"Which customer spent the most?"* — by inspecting the tables, writing
-the SQL itself, and running it through `run_query`.
+With these, Claude explores the schema and answers real questions by writing the
+SQL itself — for example, *"Which customer spent the most?"* requires joining three
+tables and computing `quantity × price`, since orders don't store a total.
 
 The mock database models a small business: `customers`, `products`, `orders`, and a
-sensitive `payment_methods` table (used to demonstrate the access guardrail below).
+sensitive `payment_methods` table.
 
-## The guardrail (the point of the project)
+## The policy layer
 
-`run_query` does not blindly execute whatever SQL the model generates. Before running
-anything, it inspects the query and refuses it if it:
+Access rules live in [`policy.yaml`](policy.yaml), not in code:
 
-1. **Is not a `SELECT`** — blocks `DELETE`, `DROP`, `UPDATE`, `INSERT`, etc.
-   The tool is read-only by design.
-2. **References the `payment_methods` table** — sensitive data is walled off.
-
-```python
-cleaned = sql.strip().lower()
-if not cleaned.startswith("select"):
-    return "Error: only read-only SELECT queries are allowed."
-if "payment_methods" in cleaned:
-    return "Error: access to payment data is restricted."
+```yaml
+allowed_statements: [SELECT]
+denied_tables:
+  - payment_methods
+  - sqlite_master
+masked_columns:
+  customers: [email]
+max_rows: 500
 ```
 
-The important property: this is enforced **server-side, in code** — not as a prompt
-instruction to the model. Prompt-based restrictions can be talked around; a server-side
-check holds regardless of what the model is prompted to do. So even if Claude is asked
-to read payment data or drop a table, the tool refuses before any query touches the
-database.
+The same server enforces a different policy per deployment — analyst, support,
+admin — without touching `server.py`.
 
-This is the same principle that matters when connecting AI to real financial or customer
-systems: the agent gets access to exactly what it needs, and the boundaries don't depend
-on the model behaving.
+### Validation runs on a parsed query, not on the text
 
-## How to run it
+The obvious implementation is a string check: does the query start with `select`,
+does it contain `payment_methods`. That is easy to write and wrong in both
+directions. It rejects `WITH ... SELECT`, which is an ordinary read that Claude
+writes routinely. And it cannot tell a table reference from the same word inside a
+string literal.
+
+So the query is parsed with [`sqlglot`](https://github.com/tobymao/sqlglot) and the
+resolved table references are checked against the policy:
+
+```python
+parsed = sqlglot.parse_one(sql, dialect="sqlite")
+referenced = {t.name.lower() for t in parsed.find_all(exp.Table)}
+if denied := referenced & policy.denied_tables:
+    raise PolicyError(f"Access to {', '.join(denied)} is restricted.")
+```
+
+A restricted table is then unreachable however it's referenced — directly, through
+a join, a subquery, a `UNION`, or a CTE. Those cases are in the test suite.
+
+### Masking fails closed
+
+Hiding a column's values only works if they can't be recovered indirectly.
+`WHERE email LIKE 'a%'` reads a masked value one character at a time; an alias or a
+function wrapper changes the output column name and defeats masking that matches on
+it. So a masked column may appear only as a plainly selected column, and anything
+else is refused rather than silently allowed.
+
+Masking itself is applied to the result set rather than the query, which is what
+makes `SELECT *` work: the column never appears in the SQL, but the cursor reports
+its real name.
+
+### The boundary that doesn't depend on application code
+
+The connection is opened read-only at the driver:
+
+```python
+sqlite3.connect(f"{DB_PATH.as_uri()}?mode=ro", uri=True)
+```
+
+This is the layer that holds if the policy layer has a bug. A test bypasses the
+policy entirely and confirms the database still refuses to change.
+
+### Audit log
+
+Every tool call appends one JSON object to `audit.log` — the query, the decision,
+and the reason for a refusal:
+
+```json
+{"timestamp": "2026-08-03T21:44:02+00:00", "tool": "run_query", "decision": "denied",
+ "sql": "SELECT * FROM payment_methods", "reason": "Access to payment_methods is restricted."}
+```
+
+An access-control layer you can't review after the fact is hard to trust, and
+*"show me what the agent actually ran"* is the first question anyone asks when an
+AI system touches customer or financial data. JSON Lines so it's queryable:
+
+```bash
+cat audit.log | jq 'select(.decision == "denied")'
+```
+
+## What the tools return
+
+Real output from the tools (see [`tests/`](tests/) for these as assertions).
+
+**An analytical query** — results come back as columns and rows, so the model isn't
+inferring the schema from tuple positions:
+
+```json
+{"columns": ["name", "total"],
+ "rows": [["Anna Schmidt", 1097.0], ["Luca Rossi", 899.0],
+          ["Marie Dubois", 447.0], ["Tom Becker", 299.0]],
+ "row_count": 4, "truncated": false}
+```
+
+**A masked column** — the rows still return, the values don't:
+
+```json
+{"columns": ["name", "email"],
+ "rows": [["Anna Schmidt", "***"], ["Luca Rossi", "***"],
+          ["Marie Dubois", "***"], ["Tom Becker", "***"]],
+ "row_count": 4, "truncated": false}
+```
+
+**A restricted table, reached through a subquery:**
+
+```
+SELECT name FROM customers WHERE id IN (SELECT customer_id FROM payment_methods)
+```
+```json
+{"error": "Access to payment_methods is restricted.",
+ "hint": "This table holds sensitive data and is not available."}
+```
+
+**An attempt to filter on a masked column:**
+
+```json
+{"error": "Column 'email' is masked and cannot be used in filters, functions, or aliases.",
+ "hint": "You may select email directly, but its values are hidden."}
+```
+
+**A write:**
+
+```json
+{"error": "Only SELECT queries are allowed (got DROP).", "hint": "This tool is read-only."}
+```
+
+Refusals carry a reason and a hint because the message is part of the interface —
+the model has to be able to work out what to do instead. The same applies to
+ordinary failures: a query against a table that doesn't exist returns an error
+naming the available tables, not a traceback.
+
+## Running it
 
 **Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/), and Claude Desktop.
 
-1. Install dependencies:
+1. Install dependencies and create the database:
    ```bash
-   uv add "mcp[cli]>=1.0,<2.0"
-   ```
-
-2. Create and seed the database:
-   ```bash
+   uv sync
    uv run setup_database.py
    ```
 
-3. Register the server with Claude Desktop. Add this to
+2. Register the server with Claude Desktop — add this to
    `claude_desktop_config.json` (Settings → Developer → Edit Config), using the
    absolute path to this folder:
    ```json
@@ -81,106 +201,71 @@ on the model behaving.
    }
    ```
 
-4. Fully restart Claude Desktop, then ask it something like
-   *"Which customer spent the most?"* and watch it query the database through the tools.
+3. Fully restart Claude Desktop, then ask it something like *"Which customer spent
+   the most?"* and watch it explore the schema and write the query itself.
 
-## Testing the guardrail
-
-The guardrail can be tested directly, without Claude, to confirm it's enforced in code:
+## Tests
 
 ```bash
-uv run test_guard.py
+uv run pytest
 ```
 
-Three assertions cover the cases that matter:
+46 tests covering the policy layer and the tools. The ones that matter most are the
+bypass attempts — a guardrail is only as good as the attacks it survives:
 
-| Query | Expected |
-|-------|----------|
-| `SELECT * FROM payment_methods` | refused — restricted data |
-| `DROP TABLE orders` | refused — not a `SELECT` |
-| `SELECT name FROM customers` | returns rows |
+| Attempt | Result |
+|---------|--------|
+| `SELECT * FROM payment_methods` | refused |
+| `SELECT * FROM PAYMENT_METHODS` | refused — case |
+| `... WHERE id IN (SELECT ... FROM payment_methods)` | refused — subquery |
+| `... JOIN payment_methods ON ...` | refused — join |
+| `WITH leak AS (SELECT * FROM payment_methods) ...` | refused — CTE |
+| `SELECT * FROM customers UNION SELECT * FROM payment_methods` | refused — union |
+| `SELECT sql FROM sqlite_master` | refused — schema disclosure |
+| `SELECT * FROM customers; DROP TABLE orders` | refused — multiple statements |
+| `SELECT name FROM customers WHERE email LIKE 'a%'` | refused — masked column in filter |
+| `SELECT upper(email) FROM customers` | refused — masked column in function |
+| `SELECT email AS contact FROM customers` | refused — masked column aliased |
+| `SELECT name FROM customers WHERE name != 'payment_methods'` | **allowed** — string literal, not a table |
+| `DELETE FROM orders` bypassing the policy entirely | refused by the read-only connection |
 
-```
-PASS  test_restricted_table_is_blocked
-PASS  test_non_select_is_blocked
-PASS  test_permitted_select_returns_rows
+That last-but-one row is the case a text-matching guard gets wrong: there is no
+table reference in it, and parsing knows the difference.
 
-All 3 guardrail tests passed.
-```
+## Limitations
 
-The tests call `run_query` directly — no model involved — so a broken guardrail
-fails the run rather than printing something that merely looks wrong. They're
-plain `assert`s, so `pytest` works too.
-
-## Demo
-
-Once the server is connected, you can ask Claude questions in plain language and it
-will explore the schema, write the SQL itself, and run it through the tools.
-
-**Asking an analytical question:**
-
-> **You:** Which customer spent the most?
->
-> **Claude:** *(calls `list_tables`, then `describe_table` on the relevant tables, then
-> `run_query` with a join across `orders`, `products`, and `customers`)*
->
-> Anna Schmidt (Berlin) spent the most — €1,097.00 across 2 orders. Full ranking:
-> Anna Schmidt €1,097.00 · Luca Rossi €899.00 · Marie Dubois €447.00 · Tom Becker €299.00.
-
-Claude worked out on its own that answering this required joining three tables and
-computing `quantity × price`, since orders don't store a total.
-
-**Hitting the guardrail:**
-
-> **You:** Show me the payment methods table.
->
-> **Claude:** The schema is readable, but the rows came back with *"access to payment
-> data is restricted"* — the restriction is enforced server-side in the tool, so the
-> data isn't returned.
-
-> **You:** Delete all the orders.
->
-> **Claude:** That's rejected by the server — `run_query` only permits read-only
-> `SELECT` statements, so a `DELETE` never reaches the database.
-
-The guardrail holds regardless of how the request is phrased, because the check runs
-in the server code — not as an instruction the model could be talked out of.
-
-## Limitations and hardening
-
-This is a prototype, and the guardrail is deliberately simple — a text-based check on
-the incoming SQL. That handles the common cases cleanly, but it has known edges I'd
-address before anything like this went to production:
-
-- **The guardrail matches on query text.** Blocking non-`SELECT` statements and the
-  `payment_methods` keyword covers the obvious cases, but text matching can be worked
-  around by sufficiently creative queries. A production version would parse the SQL
-  properly (validate the statement type and referenced tables/columns from a parsed
-  AST) rather than string-matching.
-- **`describe_table` interpolates input into the query.** For a read-only `PRAGMA`
-  this is low-risk, but it's the same string-building pattern that causes SQL
-  injection elsewhere. Production code should avoid building SQL from untrusted input.
-- **Access control lives in application code.** The strongest boundary isn't in the
-  tool at all — it's in the database. In production I'd enforce it at the data layer:
-  connect with a read-only role, and use table/column permissions so sensitive data is
-  unreachable regardless of what query is sent. Defense in depth, not a single check.
-
-The point of the prototype is the *principle* — that the boundary is enforced in code,
-server-side, and doesn't depend on the model behaving. The hardening above is how you'd
-make that principle robust for real financial or customer data.
+- **The policy covers tables and columns, not rows.** There's no concept of "this
+  user may see their own orders only." Row-level policy is the natural next step
+  and would need the query rewritten with an injected predicate, not just validated.
+- **Masking is enforced by refusing indirect use, which is blunt.** A legitimate
+  `COUNT(email)` is refused along with `WHERE email LIKE 'a%'`. Failing closed is
+  the right default, but a real system would classify expressions by whether they
+  actually leak values rather than rejecting all of them.
+- **Masked columns are matched by name across tables.** A result set doesn't carry
+  table provenance, so a same-named column on another table would be masked too.
+  Safe direction to be wrong in, but imprecise.
+- **The strongest boundary is still the database, not this code.** The read-only
+  connection is one step; in production the agent would connect as a role with
+  table and column grants, so restricted data is unreachable regardless of what
+  query is sent or what this server does.
+- **`sqlglot` is doing security-relevant work.** Any parser disagreement between it
+  and SQLite is a potential gap. Pinning the version and tracking its releases
+  matters more than it would for a formatting tool.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `server.py` | The MCP server and its tools |
-| `setup_database.py` | Creates and seeds the mock SQLite database |
-| `test_guard.py` | Tests the guardrail logic directly |
-| `business.db` | The generated SQLite database (created by the setup script) |
+| [`server.py`](server.py) | The MCP server and its three tools |
+| [`policy.py`](policy.py) | Policy loading, SQL validation, output masking |
+| [`policy.yaml`](policy.yaml) | The access policy — the part you'd change per deployment |
+| [`audit.py`](audit.py) | Append-only JSON Lines audit log |
+| [`setup_database.py`](setup_database.py) | Creates and seeds the mock SQLite database |
+| [`tests/`](tests/) | Policy and tool tests, including bypass attempts |
 
 ## Stack
 
-Python · SQLite · Model Context Protocol (MCP) · Anthropic Claude
+Python · SQLite · [sqlglot](https://github.com/tobymao/sqlglot) · Model Context Protocol (MCP) · Anthropic Claude
 
 ## License
 
