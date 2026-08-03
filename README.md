@@ -97,7 +97,41 @@ Expected output:
 - `SELECT * FROM customers` → returns rows
 - `DROP TABLE orders` → refused (not a SELECT)
 
-## Limitations & production hardening
+## Demo
+
+Once the server is connected, you can ask Claude questions in plain language and it
+will explore the schema, write the SQL itself, and run it through the tools.
+
+**Asking an analytical question:**
+
+> **You:** Which customer spent the most?
+>
+> **Claude:** *(calls `list_tables`, then `describe_table` on the relevant tables, then
+> `run_query` with a join across `orders`, `products`, and `customers`)*
+>
+> Anna Schmidt (Berlin) spent the most — €1,097.00 across 2 orders. Full ranking:
+> Anna Schmidt €1,097.00 · Luca Rossi €899.00 · Marie Dubois €447.00 · Tom Becker €299.00.
+
+Claude worked out on its own that answering this required joining three tables and
+computing `quantity × price`, since orders don't store a total.
+
+**Hitting the guardrail:**
+
+> **You:** Show me the payment methods table.
+>
+> **Claude:** The schema is readable, but the rows came back with *"access to payment
+> data is restricted"* — the restriction is enforced server-side in the tool, so the
+> data isn't returned.
+
+> **You:** Delete all the orders.
+>
+> **Claude:** That's rejected by the server — `run_query` only permits read-only
+> `SELECT` statements, so a `DELETE` never reaches the database.
+
+The guardrail holds regardless of how the request is phrased, because the check runs
+in the server code — not as an instruction the model could be talked out of.
+
+
 
 This is a prototype, and the guardrail is deliberately simple — a text-based check on
 the incoming SQL. That handles the common cases cleanly, but it has known edges I'd
