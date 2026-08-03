@@ -1,13 +1,18 @@
 
 from mcp.server.fastmcp import FastMCP
+from pathlib import Path
 import sqlite3
 
 mcp = FastMCP("Business Database Server")
 
+# Resolve the database next to this file, so the server finds it regardless of
+# the working directory it was launched from.
+DB_PATH = Path(__file__).parent / "business.db"
+
 @mcp.tool()
 def list_tables() -> str:
     """List all tables in the business database."""
-    connection = sqlite3.connect("business.db")
+    connection = sqlite3.connect(DB_PATH)
     cursor = connection.cursor()
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
     tables = cursor.fetchall()
@@ -17,7 +22,7 @@ def list_tables() -> str:
 @mcp.tool()
 def describe_table(table_name: str) -> str:
     """Show the columns and their types for a given table."""
-    connection = sqlite3.connect("business.db")
+    connection = sqlite3.connect(DB_PATH)
     cursor = connection.cursor()
     cursor.execute(f"PRAGMA table_info({table_name})")
     columns = cursor.fetchall()
@@ -39,7 +44,7 @@ def run_query(sql: str) -> str:
         return "Error: access to payment data is restricted."
 
     # If it passed both checks, run it
-    connection = sqlite3.connect("business.db")
+    connection = sqlite3.connect(DB_PATH)
     cursor = connection.cursor()
     cursor.execute(sql)
     rows = cursor.fetchall()

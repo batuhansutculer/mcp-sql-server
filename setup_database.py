@@ -1,6 +1,11 @@
 import sqlite3
+from pathlib import Path
 
-connection = sqlite3.connect("business.db")
+# Create the database next to this file, so it lands where server.py looks for it
+# regardless of the working directory this script was run from.
+DB_PATH = Path(__file__).parent / "business.db"
+
+connection = sqlite3.connect(DB_PATH)
 cursor = connection.cursor()
 
 # --- Create tables ---

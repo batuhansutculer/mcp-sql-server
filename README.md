@@ -92,10 +92,25 @@ The guardrail can be tested directly, without Claude, to confirm it's enforced i
 uv run test_guard.py
 ```
 
-Expected output:
-- `SELECT * FROM payment_methods` → refused (restricted data)
-- `SELECT * FROM customers` → returns rows
-- `DROP TABLE orders` → refused (not a SELECT)
+Three assertions cover the cases that matter:
+
+| Query | Expected |
+|-------|----------|
+| `SELECT * FROM payment_methods` | refused — restricted data |
+| `DROP TABLE orders` | refused — not a `SELECT` |
+| `SELECT name FROM customers` | returns rows |
+
+```
+PASS  test_restricted_table_is_blocked
+PASS  test_non_select_is_blocked
+PASS  test_permitted_select_returns_rows
+
+All 3 guardrail tests passed.
+```
+
+The tests call `run_query` directly — no model involved — so a broken guardrail
+fails the run rather than printing something that merely looks wrong. They're
+plain `assert`s, so `pytest` works too.
 
 ## Demo
 
@@ -131,7 +146,7 @@ computing `quantity × price`, since orders don't store a total.
 The guardrail holds regardless of how the request is phrased, because the check runs
 in the server code — not as an instruction the model could be talked out of.
 
-
+## Limitations and hardening
 
 This is a prototype, and the guardrail is deliberately simple — a text-based check on
 the incoming SQL. That handles the common cases cleanly, but it has known edges I'd
@@ -166,3 +181,7 @@ make that principle robust for real financial or customer data.
 ## Stack
 
 Python · SQLite · Model Context Protocol (MCP) · Anthropic Claude
+
+## License
+
+MIT — see [LICENSE](LICENSE).
