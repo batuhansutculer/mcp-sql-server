@@ -1,0 +1,35 @@
+# Access policy for the AI agent.
+#
+# These rules are configuration, not code: the same server can enforce a
+# different policy per deployment (analyst vs. support vs. admin) without
+# touching server.py. Everything here is enforced server-side, before any
+# query reaches the database.
+
+# Statement types the agent may run. Anything else is refused.
+allowed_statements:
+  - SELECT
+
+# Tables the agent may not read at all. Any query referencing one is refused,
+# including via subqueries, joins, or CTEs.
+denied_tables:
+  - payment_methods
+  # SQLite's own catalogue. Reading it returns the CREATE statement for every
+  # table, including the restricted ones -- schema disclosure rather than data
+  # disclosure, but there is no reason to allow it: list_tables and
+  # describe_table already give the agent the schema it is permitted to see.
+  - sqlite_master
+
+# Columns returned with their values replaced by a mask. The agent sees that
+# the column exists and how many rows there are, but not the values.
+#
+# Masked columns may only appear as plainly selected columns. Using one in a
+# WHERE clause, a function, or behind an alias is refused rather than silently
+# allowed -- otherwise `WHERE email LIKE 'a%'` would leak the value one
+# character at a time.
+masked_columns:
+  customers:
+    - email
+
+# Maximum rows returned to the agent. Protects the model's context window from
+# an unbounded `SELECT *` against a large table.
+max_rows: 500
