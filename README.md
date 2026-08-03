@@ -16,7 +16,7 @@ business systems.
 
 ```mermaid
 flowchart LR
-    C["Claude<br/>(MCP client)"] -->|tool call| S["server.py<br/>list_tables · describe_table · run_query"]
+    C["Claude<br/>(via demo.py or Claude Desktop)"] -->|tool call over MCP| S["server.py<br/>list_tables · describe_table · run_query"]
     S --> P{"policy layer<br/>parses the SQL<br/>checks policy.yaml"}
     P -->|refused| E["error + reason<br/>returned to the model"]
     P -->|allowed| D[("business.db<br/>opened read-only")]
@@ -179,15 +179,57 @@ naming the available tables, not a traceback.
 
 ## Running it
 
-**Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/), and Claude Desktop.
+**Requirements:** Python 3.10+ and [uv](https://docs.astral.sh/uv/).
 
-1. Install dependencies and create the database:
-   ```bash
-   uv sync
-   uv run setup_database.py
-   ```
+```bash
+uv sync
+uv run setup_database.py
+```
 
-2. Register the server with Claude Desktop — add this to
+### From the command line
+
+[`demo.py`](demo.py) is an MCP client: it launches the server as a subprocess,
+speaks the protocol over stdio, hands Claude the three tools, and runs the
+tool-use loop until Claude has an answer. Set `ANTHROPIC_API_KEY`, then:
+
+```bash
+uv run demo.py "Which customer spent the most?"
+```
+
+Claude explores the schema and writes the SQL itself, so the calls it makes and
+the wording of its answer vary between runs. The transcript prints each tool
+call and a one-line summary of what came back, then the answer — in this shape:
+
+```
+MCP server ready -- tools: list_tables, describe_table, run_query
+
+> Which customer spent the most?
+
+  -> list_tables()
+     customers, orders, payment_methods [restricted], products
+  -> run_query(sql=SELECT c.name, SUM(p.price * o.quantity) AS total FROM ...)
+     4 row(s)
+
+<Claude's answer>
+```
+
+A refused query is reported as a refusal rather than being flattened into an
+empty result, so hitting the guardrail is visible in the same transcript:
+
+```
+  -> run_query(sql=SELECT * FROM payment_methods)
+     REFUSED -- Access to payment_methods is restricted.
+  -> run_query(sql=SELECT name FROM customers WHERE email LIKE 'a%')
+     REFUSED -- Column 'email' is masked and cannot be used in filters, functions, or aliases.
+```
+
+Because this goes through the real protocol rather than importing the tool
+functions, it exercises the MCP layer, the policy layer, and the read-only
+connection together. Add `--verbose` to see the server's own logs.
+
+### In Claude Desktop
+
+1. Register the server — add this to
    `claude_desktop_config.json` (Settings → Developer → Edit Config), using the
    absolute path to this folder:
    ```json
@@ -210,8 +252,9 @@ naming the available tables, not a traceback.
 uv run pytest
 ```
 
-46 tests covering the policy layer and the tools. The ones that matter most are the
-bypass attempts — a guardrail is only as good as the attacks it survives:
+62 tests covering the policy layer, the tools, and the demo client's output
+formatting. The ones that matter most are the bypass attempts — a guardrail is
+only as good as the attacks it survives:
 
 | Attempt | Result |
 |---------|--------|
@@ -260,12 +303,13 @@ table reference in it, and parsing knows the difference.
 | [`policy.py`](policy.py) | Policy loading, SQL validation, output masking |
 | [`policy.yaml`](policy.yaml) | The access policy — the part you'd change per deployment |
 | [`audit.py`](audit.py) | Append-only JSON Lines audit log |
+| [`demo.py`](demo.py) | MCP client — asks Claude a question from the command line |
 | [`setup_database.py`](setup_database.py) | Creates and seeds the mock SQLite database |
 | [`tests/`](tests/) | Policy and tool tests, including bypass attempts |
 
 ## Stack
 
-Python · SQLite · [sqlglot](https://github.com/tobymao/sqlglot) · Model Context Protocol (MCP) · Anthropic Claude
+Python · SQLite · [sqlglot](https://github.com/tobymao/sqlglot) · Model Context Protocol (MCP) · [Anthropic SDK](https://github.com/anthropics/anthropic-sdk-python) · Claude Opus 5
 
 ## License
 
