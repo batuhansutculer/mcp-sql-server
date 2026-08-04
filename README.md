@@ -229,22 +229,34 @@ connection together. Add `--verbose` to see the server's own logs.
 
 ### In Claude Desktop
 
-1. Register the server — add this to
-   `claude_desktop_config.json` (Settings → Developer → Edit Config), using the
-   absolute path to this folder:
+No API key needed — a free Claude account is enough, since the model runs on
+Anthropic's side and this server is just a local subprocess it talks to.
+
+1. Register the server — add this to `claude_desktop_config.json`
+   (Settings → Developer → Edit Config), using the absolute path to this folder:
    ```json
    {
      "mcpServers": {
        "mcp-sql-server": {
-         "command": "uv",
+         "command": "/absolute/path/to/uv",
          "args": ["--directory", "/absolute/path/to/mcp-sql-server", "run", "server.py"]
        }
      }
    }
    ```
 
-3. Fully restart Claude Desktop, then ask it something like *"Which customer spent
-   the most?"* and watch it explore the schema and write the query itself.
+   **Use the absolute path to `uv`, not just `uv`.** Claude Desktop launches
+   servers with a minimal environment rather than your shell's, so a bare `uv`
+   that works in a terminal can fail to resolve there — the usual cause of a
+   server that shows up but never connects. Find it with `which uv` (macOS and
+   Linux) or `(Get-Command uv).Source` (Windows); it is often under
+   `~/.local/bin`.
+
+2. Fully quit and reopen Claude Desktop — reloading the window is not enough.
+
+3. Ask it something like *"Which customer spent the most?"* and watch it call
+   `list_tables`, inspect the schema, and write the join itself. Then ask for the
+   payment methods to see the policy layer refuse.
 
 ## Tests
 
