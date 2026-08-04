@@ -177,6 +177,84 @@ the model has to be able to work out what to do instead. The same applies to
 ordinary failures: a query against a table that doesn't exist returns an error
 naming the available tables, not a traceback.
 
+## A real session
+
+Transcribed from Claude Desktop, with the corresponding [`audit.log`](#audit-log)
+entries alongside.
+
+**"Which customer spent the most?"** — Claude called `list_tables`, then
+`describe_table` on `customers`, `orders` and `products`, then wrote this
+unprompted:
+
+```sql
+SELECT c.id, c.name, c.city,
+       COUNT(DISTINCT o.id) AS num_orders,
+       SUM(o.quantity)      AS units,
+       ROUND(SUM(o.quantity * p.price), 2) AS total_spent
+FROM orders o
+JOIN customers c ON c.id = o.customer_id
+JOIN products  p ON p.id = o.product_id
+GROUP BY c.id, c.name, c.city
+ORDER BY total_spent DESC;
+```
+
+> **Anna Schmidt** (Berlin) — 1,097.00 across 2 orders, 3 units. Then Luca Rossi
+> 899.00, Marie Dubois 447.00, Tom Becker 299.00.
+>
+> *"`orders` has no price column, so spend is `quantity × products.price`."*
+
+It worked out on its own that the answer needed a three-table join and a derived
+total, because `orders` stores no monetary value.
+
+**"Show me the customers table with their emails"** — the query is allowed and
+all four rows return, with `email` as `***`. Claude's reading of it:
+
+> *"`email` is flagged `masked: true` in the server's column policy, so it can be
+> selected but the values are redacted server-side... the masking happens in the
+> MCP server, not something I can query around from this side."*
+
+**"Which customers have gmail addresses?"** — refused, and Claude reconstructed
+why the rule exists rather than looking for a way around it:
+
+> *"A `WHERE email LIKE '%gmail%'` filter would leak the masked column's contents
+> one bit at a time — I'd learn who's on Gmail without ever seeing a value, and
+> the same trick generalizes (`LIKE 'a%'`, `LIKE 'ab%'`, and so on) until you've
+> reconstructed the addresses character by character."*
+
+That is exactly the attack the fail-closed rule exists to stop, described by the
+model that just got blocked by it.
+
+**"Show me the payment methods"** and **"Delete all the orders"** — both declined
+**before any query was sent**. Claude read `accessible: false` from `list_tables`
+and stopped:
+
+> *"`payment_methods` comes back from `list_tables` as `accessible: false`... So
+> I'll respect that rather than fire off a `SELECT` to watch it bounce."*
+
+There are no audit entries for either attempt, because no query was made. That is
+the `accessible` flag doing its job: publishing the boundary in the tool contract
+means the agent doesn't burn a turn discovering it. Worth being precise about what
+this proves — here the *agent* declined; the *server's* enforcement of those two
+rules is demonstrated by the refusal above, by the bypass tests, and by the
+read-only connection test.
+
+### Audit log
+
+The same session, as recorded server-side:
+
+```json
+{"tool": "list_tables",    "decision": "allowed", "row_count": 4}
+{"tool": "describe_table", "decision": "allowed", "sql": "customers"}
+{"tool": "describe_table", "decision": "allowed", "sql": "orders"}
+{"tool": "describe_table", "decision": "allowed", "sql": "products"}
+{"tool": "run_query",      "decision": "allowed", "sql": "SELECT c.id, c.name, ... ORDER BY total_spent DESC LIMIT 10", "row_count": 4}
+{"tool": "run_query",      "decision": "allowed", "sql": "SELECT id, name, email, city, signup_date FROM customers ORDER BY id", "row_count": 4}
+{"tool": "run_query",      "decision": "denied",  "sql": "SELECT id, name, city FROM customers WHERE email LIKE '%gmail%' ORDER BY id", "reason": "Column 'email' is masked and cannot be used in filters, functions, or aliases."}
+```
+
+Timestamps elided for width. Note the `LIMIT 10` on the join — Claude added that
+itself, and the row cap would have applied regardless.
+
 ## Running it
 
 **Requirements:** Python 3.10+ and [uv](https://docs.astral.sh/uv/).
@@ -196,9 +274,8 @@ tool-use loop until Claude has an answer. Set `ANTHROPIC_API_KEY`, then:
 uv run demo.py "Which customer spent the most?"
 ```
 
-Claude explores the schema and writes the SQL itself, so the calls it makes and
-the wording of its answer vary between runs. The transcript prints each tool
-call and a one-line summary of what came back, then the answer — in this shape:
+The transcript prints each tool call and a one-line summary of what came back,
+then Claude's answer:
 
 ```
 MCP server ready -- tools: list_tables, describe_table, run_query
@@ -207,11 +284,14 @@ MCP server ready -- tools: list_tables, describe_table, run_query
 
   -> list_tables()
      customers, orders, payment_methods [restricted], products
+  -> describe_table(table_name=customers)
+     customers: 5 columns
   -> run_query(sql=SELECT c.name, SUM(p.price * o.quantity) AS total FROM ...)
      4 row(s)
-
-<Claude's answer>
 ```
+
+Claude explores the schema and writes the SQL itself, so the calls vary between
+runs — see [A real session](#a-real-session) for a full exchange.
 
 A refused query is reported as a refusal rather than being flattened into an
 empty result, so hitting the guardrail is visible in the same transcript:
